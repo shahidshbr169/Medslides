@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const crypto = require('crypto');
+const JSZip = require('jszip');
+const xml2js = require('xml2js');
 const { createClient } = require('@supabase/supabase-js');
 
 // Initialize Supabase admin client
@@ -9,6 +11,35 @@ const supabase = createClient(
   process.env.SUPABASE_URL || 'https://placeholder.supabase.co', 
   process.env.SUPABASE_SERVICE_KEY || 'placeholder'
 );
+
+// Helper: Slice PPTX to first 7 slides
+async function slicePptx(buffer, maxSlides = 7) {
+  try {
+    const zip = await JSZip.loadAsync(buffer);
+    const presXmlPath = 'ppt/presentation.xml';
+    const presFile = zip.file(presXmlPath);
+    if (!presFile) return buffer;
+
+    const presXmlStr = await presFile.async('string');
+    const parser = new xml2js.Parser();
+    const builder = new xml2js.Builder();
+    const presObj = await parser.parseStringPromise(presXmlStr);
+    
+    if (presObj['p:presentation'] && presObj['p:presentation']['p:sldIdLst']) {
+      const sldIdLst = presObj['p:presentation']['p:sldIdLst'][0]['p:sldId'];
+      if (sldIdLst && sldIdLst.length > maxSlides) {
+        presObj['p:presentation']['p:sldIdLst'][0]['p:sldId'] = sldIdLst.slice(0, maxSlides);
+        const newXmlStr = builder.buildObject(presObj);
+        zip.file(presXmlPath, newXmlStr);
+        return await zip.generateAsync({ type: 'nodebuffer' });
+      }
+    }
+    return buffer;
+  } catch (err) {
+    console.error('PPT Slicing Error:', err);
+    return buffer;
+  }
+}
 
 // Set up Multer for memory storage
 const upload = multer({ storage: multer.memoryStorage() });
@@ -27,55 +58,71 @@ router.use(verifyAdmin);
 // POST /api/admin/product
 router.post('/product', upload.fields([
   { name: 'pptFile', maxCount: 1 },
-  { name: 'previewImages', maxCount: 5 }
+  { name: 'thumbnail', maxCount: 1 }
 ]), async (req, res) => {
+  console.log('--- Product Upload Start ---');
   try {
-    const { title, description, price, subject, total_slides } = req.body;
+    const { title, description, price, subject, total_slides, level } = req.body;
+    console.log('Backend Received Metadata:', { title, price, subject, total_slides, level });
+    
     const pptFile = req.files && req.files['pptFile'] ? req.files['pptFile'][0] : null;
-    const previewImages = req.files && req.files['previewImages'] ? req.files['previewImages'] : [];
+    const thumbnailFile = req.files && req.files['thumbnail'] ? req.files['thumbnail'][0] : null;
 
-    if (!title || !price || !pptFile || previewImages.length === 0) {
+    if (!title || !price || !pptFile || !thumbnailFile) {
+      console.warn('Missing fields or files:', { 
+        hasTitle: !!title, 
+        hasPrice: !!price, 
+        hasPpt: !!pptFile, 
+        hasThumb: !!thumbnailFile 
+      });
       return res.status(400).json({ error: 'Missing required text fields or files' });
     }
 
+    console.log('Files metadata:', {
+      ppt: { name: pptFile.originalname, size: pptFile.size, type: pptFile.mimetype },
+      thumb: { name: thumbnailFile.originalname, size: thumbnailFile.size, type: thumbnailFile.mimetype }
+    });
+
     const productId = crypto.randomUUID();
     
-    // 2. Upload PPT to 'ppts' private bucket
+    // 1. Upload Full PPT to 'ppts' private bucket
     const pptPath = `products/${productId}/${pptFile.originalname}`;
-    const { error: pptUploadError } = await supabase.storage
-      .from('ppts')
-      .upload(pptPath, pptFile.buffer, {
+    await supabase.storage.from('ppts').upload(pptPath, pptFile.buffer, {
+      contentType: pptFile.mimetype,
+      upsert: true
+    });
+
+    // 2. Auto-generate Sample PPT (first 7 slides)
+    const sampleBuffer = await slicePptx(pptFile.buffer, 7);
+    const previewPptPath = `previews/${productId}/sample_${pptFile.originalname}`;
+    
+    const { error: sampleUploadError } = await supabase.storage
+      .from('previews')
+      .upload(previewPptPath, sampleBuffer, {
         contentType: pptFile.mimetype,
         upsert: true
       });
 
-    if (pptUploadError) {
-      console.error('PPT Upload Error:', pptUploadError);
-      return res.status(500).json({ error: 'Failed to upload presentation file to storage' });
+    if (sampleUploadError) {
+      console.error('Sample PPT Upload Error:', sampleUploadError);
+      return res.status(500).json({ error: 'Failed to generate and upload preview file' });
     }
 
-    // 3. Upload previews to 'previews' public bucket
-    const previewPaths = [];
-    for (let i = 0; i < previewImages.length; i++) {
-      const img = previewImages[i];
-      const imgPath = `previews/${productId}/${i}.jpg`;
-      const { error: imgUploadError } = await supabase.storage
-        .from('previews')
-        .upload(imgPath, img.buffer, {
-          contentType: img.mimetype || 'image/jpeg',
-          upsert: true
-        });
-      
-      if (imgUploadError) {
-        console.error('Image Upload Error:', imgUploadError);
-        return res.status(500).json({ error: 'Failed to upload preview image' });
-      }
-      previewPaths.push(imgPath);
+    // 3. Upload Thumbnail to 'previews' public bucket
+    const thumbnailPath = `previews/${productId}/thumbnail.jpg`;
+    const { error: thumbUploadError } = await supabase.storage
+      .from('previews')
+      .upload(thumbnailPath, thumbnailFile.buffer, {
+        contentType: thumbnailFile.mimetype || 'image/jpeg',
+        upsert: true
+      });
+
+    if (thumbUploadError) {
+      console.error('Thumbnail Upload Error:', thumbUploadError);
+      return res.status(500).json({ error: 'Failed to upload thumbnail image' });
     }
 
     // 4. Insert product row
-    const thumbnail = previewPaths[0]; // Set the first uploaded preview as the primary thumbnail
-
     const { error: insertError } = await supabase
       .from('products')
       .insert([{
@@ -85,9 +132,10 @@ router.post('/product', upload.fields([
         price: parseInt(price, 10),
         subject: subject || 'Uncategorized',
         total_slides: parseInt(total_slides, 10) || 0,
+        level: level || 'UG',
         ppt_path: pptPath,
-        preview_paths: previewPaths,
-        thumbnail
+        preview_paths: [previewPptPath], // Store sample path in the array for compatibility
+        thumbnail: thumbnailPath
       }]);
 
     if (insertError) {
@@ -96,11 +144,48 @@ router.post('/product', upload.fields([
     }
 
     // 5. Return success
+    console.log('Product upload and processing complete. ID:', productId);
     res.json({ success: true, productId });
 
   } catch (err) {
     console.error('Admin Upload Product Error:', err);
     res.status(500).json({ error: 'Internal server error while uploading' });
+  }
+});
+
+// PATCH /api/admin/product/:id
+router.patch('/product/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, description, price, subject, total_slides, level } = req.body;
+
+    const updateData = {};
+    if (title !== undefined) updateData.title = title;
+    if (description !== undefined) updateData.description = description;
+    if (price !== undefined && price !== '') updateData.price = parseInt(price, 10);
+    if (subject !== undefined) updateData.subject = subject;
+    if (total_slides !== undefined && total_slides !== '') updateData.total_slides = parseInt(total_slides, 10);
+    if (level !== undefined) updateData.level = level;
+
+    const { data, error } = await supabase
+      .from('products')
+      .update(updateData)
+      .eq('id', id)
+      .select();
+
+    if (error) {
+      console.error('Update Product Error:', error);
+      return res.status(500).json({ error: 'Failed to update product' });
+    }
+
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    res.json({ success: true, product: data[0] });
+  } catch (err) {
+    console.error('Admin Update Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -112,7 +197,7 @@ router.delete('/product/:id', async (req, res) => {
     // 1. Get product row to find file paths
     const { data: product, error: productError } = await supabase
       .from('products')
-      .select('ppt_path, preview_paths')
+      .select('ppt_path, preview_paths, thumbnail')
       .eq('id', id)
       .single();
 
@@ -122,14 +207,16 @@ router.delete('/product/:id', async (req, res) => {
 
     // 2. Delete ppt from 'ppts' bucket
     if (product.ppt_path) {
-      const { error: pptDelErr } = await supabase.storage.from('ppts').remove([product.ppt_path]);
-      if (pptDelErr) console.error('Error deleting PPT:', pptDelErr);
+      await supabase.storage.from('ppts').remove([product.ppt_path]);
     }
 
-    // 3. Delete previews from 'previews' bucket
-    if (product.preview_paths && product.preview_paths.length > 0) {
-      const { error: previewDelErr } = await supabase.storage.from('previews').remove(product.preview_paths);
-      if (previewDelErr) console.error('Error deleting previews:', previewDelErr);
+    // 3. Delete previews & thumbnail from 'previews' bucket
+    const filesToDelete = [...(product.preview_paths || [])];
+    if (product.thumbnail) filesToDelete.push(product.thumbnail);
+
+    if (filesToDelete.length > 0) {
+      const { error: previewDelErr } = await supabase.storage.from('previews').remove(filesToDelete);
+      if (previewDelErr) console.error('Error deleting previews/thumbnail:', previewDelErr);
     }
 
     // 4. Delete product row
