@@ -1,0 +1,38 @@
+-- Products table
+create table products (
+  id uuid default gen_random_uuid() primary key,
+  title text not null,
+  description text,
+  price integer not null,
+  subject text,
+  total_slides integer,
+  ppt_path text not null,
+  preview_paths text[] not null,
+  thumbnail text,
+  created_at timestamptz default now()
+);
+
+-- Purchases table
+create table purchases (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users not null,
+  product_id uuid references products(id) not null,
+  razorpay_order_id text,
+  razorpay_payment_id text,
+  amount integer,
+  purchased_at timestamptz default now()
+);
+
+-- Enable RLS
+alter table products enable row level security;
+alter table purchases enable row level security;
+
+-- Policies
+create policy "Anyone can view products"
+  on products for select using (true);
+
+create policy "Users can view own purchases"
+  on purchases for select using (auth.uid() = user_id);
+
+create policy "Backend can insert purchases"
+  on purchases for insert with check (true);
