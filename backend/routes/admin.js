@@ -4,7 +4,11 @@ const multer = require('multer');
 const crypto = require('crypto');
 const JSZip = require('jszip');
 const xml2js = require('xml2js');
+const CloudConvert = require('cloudconvert');
 const { createClient } = require('@supabase/supabase-js');
+
+// Initialize CloudConvert (requires API key in .env)
+const cloudConvert = new CloudConvert(process.env.CLOUDCONVERT_API_KEY || 'placeholder');
 
 // Initialize Supabase admin client
 const supabase = createClient(
@@ -58,7 +62,8 @@ router.use(verifyAdmin);
 // POST /api/admin/product
 router.post('/product', upload.fields([
   { name: 'pptFile', maxCount: 1 },
-  { name: 'thumbnail', maxCount: 1 }
+  { name: 'thumbnail', maxCount: 1 },
+  { name: 'previewPdf', maxCount: 1 }
 ]), async (req, res) => {
   console.log('--- Product Upload Start ---');
   try {
@@ -92,20 +97,71 @@ router.post('/product', upload.fields([
       upsert: true
     });
 
-    // 2. Auto-generate Sample PPT (first 7 slides)
-    const sampleBuffer = await slicePptx(pptFile.buffer, 7);
-    const previewPptPath = `previews/${productId}/sample_${pptFile.originalname}`;
-    
-    const { error: sampleUploadError } = await supabase.storage
-      .from('previews')
-      .upload(previewPptPath, sampleBuffer, {
-        contentType: pptFile.mimetype,
+    // 2. Handle Preview (Manual PDF or Auto-generate from sliced PPTX)
+    let finalPreviewPath = '';
+    const manualPdf = req.files && req.files['previewPdf'] ? req.files['previewPdf'][0] : null;
+
+    if (manualPdf) {
+      console.log('Using manual PDF preview override');
+      finalPreviewPath = `previews/${productId}/preview_${manualPdf.originalname}`;
+      await supabase.storage.from('previews').upload(finalPreviewPath, manualPdf.buffer, {
+        contentType: 'application/pdf',
         upsert: true
       });
+    } else {
+      console.log('Generating automatic PDF preview via CloudConvert...');
+      try {
+        const sampleBuffer = await slicePptx(pptFile.buffer, 7);
+        const job = await cloudConvert.jobs.create({
+          "tasks": {
+            "import-1": {
+              "operation": "import/base64",
+              "file": sampleBuffer.toString('base64'),
+              "filename": "sample.pptx"
+            },
+            "task-1": {
+              "operation": "convert",
+              "input": ["import-1"],
+              "output_format": "pdf"
+            },
+            "export-1": {
+              "operation": "export/url",
+              "input": ["task-1"],
+              "inline": false,
+              "archive_export": false
+            }
+          },
+          "tag": `medslides-${productId}`
+        });
 
-    if (sampleUploadError) {
-      console.error('Sample PPT Upload Error:', sampleUploadError);
-      return res.status(500).json({ error: 'Failed to generate and upload preview file' });
+        // Wait for job completion (polling)
+        const finishedJob = await cloudConvert.jobs.wait(job.id);
+        const exportTask = finishedJob.tasks.filter(t => t.operation === 'export/url' && t.status === 'finished')[0];
+        
+        if (exportTask && exportTask.result && exportTask.result.files) {
+          const fileUrl = exportTask.result.files[0].url;
+          const pdfRes = await fetch(fileUrl);
+          const pdfBuffer = await pdfRes.arrayBuffer();
+          
+          finalPreviewPath = `previews/${productId}/preview_auto.pdf`;
+          await supabase.storage.from('previews').upload(finalPreviewPath, Buffer.from(pdfBuffer), {
+            contentType: 'application/pdf',
+            upsert: true
+          });
+          console.log('Auto-PDF generation successful');
+        } else {
+          throw new Error('CloudConvert export task failed');
+        }
+      } catch (convErr) {
+        console.error('PDF Conversion Error (Falling back to PPTX slice):', convErr);
+        // Fallback: Just upload the sliced PPTX if conversion fails
+        const sampleBuffer = await slicePptx(pptFile.buffer, 7);
+        finalPreviewPath = `previews/${productId}/sample_${pptFile.originalname}`;
+        await supabase.storage.from('previews').upload(finalPreviewPath, sampleBuffer, {
+          contentType: pptFile.mimetype,
+          upsert: true
+        });
+      }
     }
 
     // 3. Upload Thumbnail to 'previews' public bucket
@@ -134,7 +190,7 @@ router.post('/product', upload.fields([
         total_slides: parseInt(total_slides, 10) || 0,
         level: level || 'UG',
         ppt_path: pptPath,
-        preview_paths: [previewPptPath], // Store sample path in the array for compatibility
+        preview_paths: [finalPreviewPath],
         thumbnail: thumbnailPath
       }]);
 
