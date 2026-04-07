@@ -16,10 +16,17 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET || 'placeholder'
 });
 
+// Promo codes mapping (Code: Discount percentage as decimal)
+const PROMO_CODES = {
+  'MED10': 0.10,
+  'WELCOME20': 0.20,
+  'SAVE50': 0.50
+};
+
 // POST /api/payment/create-order
 router.post('/create-order', async (req, res) => {
   try {
-    const { productId, productIds, userId } = req.body;
+    const { productId, productIds, userId, promoCode } = req.body;
     const items = productIds || (productId ? [productId] : []);
 
     if (items.length === 0 || !userId) {
@@ -48,13 +55,32 @@ router.post('/create-order', async (req, res) => {
     }
 
     // Calculate total amount from DB prices
-    const totalAmount = products.reduce((sum, p) => sum + p.price, 0);
+    let totalAmount = products.reduce((sum, p) => sum + p.price, 0);
+    let discountAmount = 0;
+
+    // Apply Promo Code if valid
+    if (promoCode) {
+      const discountPercent = PROMO_CODES[promoCode.toUpperCase()];
+      if (discountPercent) {
+        discountAmount = Math.floor(totalAmount * discountPercent);
+        totalAmount = totalAmount - discountAmount;
+      } else {
+        // Optional: you could return an error, but usually we just ignore invalid codes in create-order if they were already "validated" via a separate check (which we will add). 
+        // For security, if the user sends an invalid code expecting a discount, we should probably tell them.
+        // However, to keep it simple, if it's invalid, they just pay full price.
+      }
+    }
 
     // 3. Create Razorpay order
     const options = {
       amount: totalAmount, // Price is already in paise
       currency: 'INR',
-      receipt: `receipt_${Date.now()}_${userId.slice(0, 5)}`
+      receipt: `receipt_${Date.now()}_${userId.slice(0, 5)}`,
+      notes: {
+        promoCode: promoCode || 'NONE',
+        originalAmount: totalAmount + discountAmount,
+        discount: discountAmount
+      }
     };
 
     const order = await razorpay.orders.create(options);
@@ -64,7 +90,9 @@ router.post('/create-order', async (req, res) => {
       orderId: order.id,
       amount: order.amount,
       currency: order.currency,
-      keyId: process.env.RAZORPAY_KEY_ID
+      keyId: process.env.RAZORPAY_KEY_ID,
+      discount: discountAmount,
+      total: totalAmount
     });
 
   } catch (err) {
@@ -127,6 +155,18 @@ router.post('/verify', async (req, res) => {
   } catch (err) {
     console.error('Verify Payment Error:', err);
     res.status(500).json({ error: 'Internal server error during verification' });
+  }
+});
+
+// GET /api/payment/validate-promo/:code
+router.get('/validate-promo/:code', (req, res) => {
+  const code = req.params.code.toUpperCase();
+  const discountPercent = PROMO_CODES[code];
+  
+  if (discountPercent) {
+    res.json({ valid: true, discountPercent });
+  } else {
+    res.json({ valid: false, message: 'Invalid promo code' });
   }
 });
 
