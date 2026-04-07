@@ -19,39 +19,42 @@ const razorpay = new Razorpay({
 // POST /api/payment/create-order
 router.post('/create-order', async (req, res) => {
   try {
-    const { productId, userId } = req.body;
-    if (!productId || !userId) {
-      return res.status(400).json({ error: 'Missing productId or userId' });
+    const { productId, productIds, userId } = req.body;
+    const items = productIds || (productId ? [productId] : []);
+
+    if (items.length === 0 || !userId) {
+      return res.status(400).json({ error: 'Missing productIds or userId' });
     }
 
-    // 1. Verify product exists in Supabase
-    const { data: product, error: productError } = await supabase
+    // 1. Verify all products exist in Supabase
+    const { data: products, error: productError } = await supabase
       .from('products')
-      .select('price')
-      .eq('id', productId)
-      .single();
+      .select('id, price')
+      .in('id', items);
 
-    if (productError || !product) {
-      return res.status(404).json({ error: 'Product not found' });
+    if (productError || !products || products.length !== items.length) {
+      return res.status(404).json({ error: 'One or more products not found' });
     }
 
-    // 2. Check user hasn't already purchased
-    const { data: existingPurchase, error: purchaseError } = await supabase
+    // 2. Check user hasn't already purchased any of them
+    const { data: existingPurchases, error: purchaseError } = await supabase
       .from('purchases')
       .select('id')
       .eq('user_id', userId)
-      .eq('product_id', productId)
-      .maybeSingle();
+      .in('product_id', items);
 
-    if (existingPurchase) {
-      return res.status(400).json({ error: 'User has already purchased this product' });
+    if (existingPurchases && existingPurchases.length > 0) {
+      return res.status(400).json({ error: 'User has already purchased one or more of these products' });
     }
+
+    // Calculate total amount from DB prices
+    const totalAmount = products.reduce((sum, p) => sum + p.price, 0);
 
     // 3. Create Razorpay order
     const options = {
-      amount: product.price, // Price is already configured in paise
+      amount: totalAmount, // Price is already in paise
       currency: 'INR',
-      receipt: `receipt_${Date.now()}_${productId.slice(0, 5)}`
+      receipt: `receipt_${Date.now()}_${userId.slice(0, 5)}`
     };
 
     const order = await razorpay.orders.create(options);
@@ -73,9 +76,10 @@ router.post('/create-order', async (req, res) => {
 // POST /api/payment/verify
 router.post('/verify', async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, productId, userId } = req.body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, productId, productIds, userId } = req.body;
+    const items = productIds || (productId ? [productId] : []);
 
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !productId || !userId) {
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || items.length === 0 || !userId) {
       return res.status(400).json({ error: 'Missing required payment verification fields' });
     }
 
@@ -90,29 +94,28 @@ router.post('/verify', async (req, res) => {
       return res.status(400).json({ error: 'Invalid payment signature' });
     }
 
-    // Retrieve product amount to save in purchases table
-    const { data: product, error: productError } = await supabase
+    // Retrieve product amounts to save in purchases table
+    const { data: products, error: productError } = await supabase
       .from('products')
-      .select('price')
-      .eq('id', productId)
-      .single();
+      .select('id, price')
+      .in('id', items);
 
-    if (productError || !product) {
+    if (productError || !products || products.length === 0) {
       return res.status(404).json({ error: 'Product not found during verification' });
     }
 
-    // 2. Insert into purchases table
+    // 2. Insert into purchases table formatting for multiple
+    const insertData = products.map(p => ({
+      user_id: userId,
+      product_id: p.id,
+      razorpay_order_id,
+      razorpay_payment_id,
+      amount: p.price
+    }));
+
     const { error: insertError } = await supabase
       .from('purchases')
-      .insert([
-        {
-          user_id: userId,
-          product_id: productId,
-          razorpay_order_id,
-          razorpay_payment_id,
-          amount: product.price
-        }
-      ]);
+      .insert(insertData);
 
     if (insertError) {
       console.error('Error inserting purchase:', insertError);
