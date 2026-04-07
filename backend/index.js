@@ -8,7 +8,10 @@ const PORT = process.env.PORT || 3000;
 // CORS configuration - uses FRONTEND_URL from .env
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'https://medslides.in',
-  /^http:\/\/localhost(:\d+)?$/
+  /^http:\/\/localhost(:\d+)?$/,
+  /^http:\/\/127\.0\.0\.1(:\d+)?$/,
+  /^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/,
+  /^http:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/
 ];
 app.use(cors({
   origin: allowedOrigins

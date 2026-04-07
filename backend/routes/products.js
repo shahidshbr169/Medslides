@@ -14,7 +14,7 @@ router.get('/', async (req, res) => {
     // We strictly select fields and NOT ppt_path
     const { data, error } = await supabase
       .from('products')
-      .select('id, title, description, price, subject, total_slides, level, thumbnail, preview_paths');
+      .select('id, title, description, price, subject, total_slides, level, thumbnail, preview_paths, created_at');
 
     if (error) {
       console.error('Error fetching products:', error);
@@ -36,7 +36,7 @@ router.get('/:id', async (req, res) => {
     // Select same set of fields, omitting ppt_path
     const { data, error } = await supabase
       .from('products')
-      .select('id, title, description, price, subject, total_slides, level, thumbnail, preview_paths')
+      .select('id, title, description, price, subject, total_slides, level, thumbnail, preview_paths, created_at')
       .eq('id', id)
       .single();
 
