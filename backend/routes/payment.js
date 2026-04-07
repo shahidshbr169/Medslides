@@ -16,12 +16,51 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET || 'placeholder'
 });
 
-// Promo codes mapping (Code: Discount percentage as decimal)
-const PROMO_CODES = {
-  'MED10': 0.10,
-  'WELCOME20': 0.20,
-  'SAVE50': 0.50
-};
+// Advanced Promo Code Validation Helper
+async function validatePromoInternal(code, userId, productIds) {
+  if (!code) return { valid: false };
+  const codeUpper = code.toUpperCase();
+  
+  if (codeUpper === 'WELCOME') {
+    // Check if user has any prior purchases
+    const { count, error } = await supabase
+      .from('purchases')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId);
+    
+    if (error) {
+      console.error('Promo verification SQL error:', error);
+      return { valid: false, message: 'Verification service error.' };
+    }
+    if (count > 0) return { valid: false, message: 'WELCOME is only available for your first purchase.' };
+    return { valid: true, discountPercent: 0.10 };
+  }
+
+  if (codeUpper === 'BUNDLE') {
+    const itemCount = productIds.length;
+    if (itemCount >= 5) return { valid: true, discountPercent: 0.30 };
+    if (itemCount >= 3) return { valid: true, discountPercent: 0.15 };
+    return { valid: false, message: 'BUNDLE requires at least 3 items (15%) or 5 items (30%).' };
+  }
+
+  return { valid: false, message: 'Invalid promo code.' };
+}
+
+// POST /api/payment/validate-promo
+router.post('/validate-promo', async (req, res) => {
+  try {
+    const { code, userId, productIds } = req.body;
+    if (!code || !userId || !productIds) {
+      return res.status(400).json({ valid: false, message: 'Missing validation data' });
+    }
+    
+    const result = await validatePromoInternal(code, userId, productIds);
+    res.json(result);
+  } catch (err) {
+    console.error('Promo validation error:', err);
+    res.status(500).json({ valid: false, message: 'Internal error validating promo' });
+  }
+});
 
 // POST /api/payment/create-order
 router.post('/create-order', async (req, res) => {
@@ -57,17 +96,15 @@ router.post('/create-order', async (req, res) => {
     // Calculate total amount from DB prices
     let totalAmount = products.reduce((sum, p) => sum + p.price, 0);
     let discountAmount = 0;
+    let appliedDiscountPercent = 0;
 
-    // Apply Promo Code if valid
+    // Apply Promo Code if provided
     if (promoCode) {
-      const discountPercent = PROMO_CODES[promoCode.toUpperCase()];
-      if (discountPercent) {
-        discountAmount = Math.floor(totalAmount * discountPercent);
+      const promoResult = await validatePromoInternal(promoCode, userId, items);
+      if (promoResult.valid) {
+        appliedDiscountPercent = promoResult.discountPercent;
+        discountAmount = Math.floor(totalAmount * appliedDiscountPercent);
         totalAmount = totalAmount - discountAmount;
-      } else {
-        // Optional: you could return an error, but usually we just ignore invalid codes in create-order if they were already "validated" via a separate check (which we will add). 
-        // For security, if the user sends an invalid code expecting a discount, we should probably tell them.
-        // However, to keep it simple, if it's invalid, they just pay full price.
       }
     }
 
@@ -79,7 +116,8 @@ router.post('/create-order', async (req, res) => {
       notes: {
         promoCode: promoCode || 'NONE',
         originalAmount: totalAmount + discountAmount,
-        discount: discountAmount
+        discount: discountAmount,
+        discountPercent: appliedDiscountPercent
       }
     };
 
@@ -155,18 +193,6 @@ router.post('/verify', async (req, res) => {
   } catch (err) {
     console.error('Verify Payment Error:', err);
     res.status(500).json({ error: 'Internal server error during verification' });
-  }
-});
-
-// GET /api/payment/validate-promo/:code
-router.get('/validate-promo/:code', (req, res) => {
-  const code = req.params.code.toUpperCase();
-  const discountPercent = PROMO_CODES[code];
-  
-  if (discountPercent) {
-    res.json({ valid: true, discountPercent });
-  } else {
-    res.json({ valid: false, message: 'Invalid promo code' });
   }
 });
 
